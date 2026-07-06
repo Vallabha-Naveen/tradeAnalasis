@@ -1,0 +1,42 @@
+{
+  "name": "telegram-trade-analyzer",
+  "version": "0.1.0",
+  "description": "Automatically analyze trading screenshots posted in Telegram channels",
+  "main": "dist/app.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/app.js",
+    "dev": "ts-node src/app.ts",
+    "lint": "eslint src/**/*.ts",
+    "format": "prettier --write \"src/**/*.ts\"",
+    "clean": "rm -rf dist",
+    "query": "node dist/scripts/query.js",
+    "reprocess": "node dist/scripts/reprocess.js",
+    "analyze": "node dist/scripts/analyze.js",
+    "calibrate": "node dist/scripts/calibrateWhitespace.js"
+  },
+  "keywords": ["telegram", "trading", "analyzer", "ocr", "options"],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "telegram": "^2.22.2",
+    "sharp": "^0.33.5",
+    "tesseract.js": "^5.1.1",
+    "better-sqlite3": "^11.7.0",
+    "dotenv": "^16.4.7",
+    "winston": "^3.17.0",
+    "input": "^1.0.1"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/node": "^22.10.0",
+    "@typescript-eslint/eslint-plugin": "^8.18.0",
+    "@typescript-eslint/parser": "^8.18.0",
+    "eslint": "^9.16.0",
+    "eslint-config-prettier": "^9.1.0",
+    "eslint-plugin-prettier": "^5.2.1",
+    "prettier": "^3.4.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}
