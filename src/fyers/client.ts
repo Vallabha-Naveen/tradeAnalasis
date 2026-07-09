@@ -122,9 +122,38 @@ export class FyersClient {
   // Order operations
   // -------------------------------------------------------------------------
 
+  /**
+   * Place a new order.
+   *
+   * PROXY HANDLING
+   * --------------
+   * Only this method routes through the Fixie proxy (if configured).
+   * Fyers requires order placement to come from a whitelisted static IP,
+   * but read-only calls (quotes, option chain, positions, etc.) work
+   * from any IP. So we toggle HTTPS_PROXY on around this call and off
+   * after, keeping all other Fyers calls direct.
+   *
+   * This is safe because order placement is serialized via the AsyncMutex
+   * in liveListener — no concurrent Fyers calls happen while the proxy
+   * is enabled.
+   */
   async placeOrder(params: OrderParams): Promise<OrderResponse> {
     await this.initFyers();
+
+    const fixieUrl = process.env['FIXIE_URL'];
+    const proxyWasSet = !!process.env['HTTPS_PROXY'];
+
     try {
+      // Enable proxy ONLY for this call
+      if (fixieUrl) {
+        process.env['HTTP_PROXY'] = fixieUrl;
+        process.env['HTTPS_PROXY'] = fixieUrl;
+        // axios reads these env vars when creating a request, so we must
+        // force re-init of the Fyers instance so it picks up the proxy.
+        // However, the Fyers SDK creates axios requests per-call, so the
+        // env vars will be respected without re-init.
+      }
+
       process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '0';
       const response = await this.fyersInstance.place_order(params);
       const result = response as OrderResponse;
@@ -136,6 +165,12 @@ export class FyersClient {
       return result;
     } finally {
       process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '1';
+      // Remove proxy so subsequent read calls (getQuote, getOptionChain, etc.)
+      // go direct — they don't need the static IP.
+      if (fixieUrl && !proxyWasSet) {
+        delete process.env['HTTP_PROXY'];
+        delete process.env['HTTPS_PROXY'];
+      }
     }
   }
 

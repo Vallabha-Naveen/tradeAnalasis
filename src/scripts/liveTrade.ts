@@ -28,8 +28,43 @@ import input from 'input';
 
 dotenv.config();
 
+/**
+ * Configure the Fixie proxy URL (without activating it globally).
+ *
+ * WHY
+ * ---
+ * Fyers requires only ORDER PLACEMENT calls to come from a whitelisted
+ * static IP. Read-only calls (profile, quotes, option chain, positions,
+ * order book) work fine from any IP.
+ *
+ * So instead of setting HTTP_PROXY/HTTPS_PROXY globally (which routes ALL
+ * Fyers calls through Fixie), we store the Fixie URL in a custom env var
+ * (`FIXIE_URL`) and the FyersClient toggles the proxy on/off around the
+ * `place_order` call only.
+ *
+ * This minimizes Fixie usage (1 request per trade instead of 7) and keeps
+ * read calls fast and direct.
+ *
+ * FIXIE_URL format: http://USERNAME:PASSWORD@proxy.usefixie.com:80
+ */
+function configureFixieProxy(): void {
+  const fixieUrl = process.env['FIXIE_URL'];
+  if (!fixieUrl) {
+    console.log('Fixie proxy: not configured (set FIXIE_URL in .env to enable)');
+    return;
+  }
+
+  // Store in a custom env var — FyersClient.placeOrder() reads this and
+  // toggles HTTPS_PROXY on/off around the place_order call.
+  const safeUrl = fixieUrl.replace(/(\/\/)([^:]+):([^@]+)@/, '$1***:***@');
+  console.log(`Fixie proxy configured (used for order placement only): ${safeUrl}`);
+}
+
 async function main(): Promise<void> {
   console.log('=== Live Trading Mode ===\n');
+
+  // Configure Fixie proxy BEFORE any Fyers API calls
+  configureFixieProxy();
 
   const channelUsername = process.env['CHANNEL_USERNAME'];
   const dryRun = process.env['DRY_RUN'] !== 'false';

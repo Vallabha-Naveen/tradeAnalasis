@@ -186,16 +186,38 @@ export async function prepareOrder(
   const orderValue = option.ltp * qty;
 
   // 4. Build order params — SELL for option selling, MARKET for immediate fill
+  //
+  //    FYERS API v3 ORDER TYPES
+  //    ------------------------
+  //    type: 1 = LIMIT order  (requires a valid limitPrice)
+  //    type: 2 = MARKET order (executes immediately at market price)
+  //    type: 3 = SL (stop-loss)
+  //    type: 4 = SL-M (stop-loss market)
+  //
+  //    For option selling, we use type: 2 (MARKET) for immediate fills.
+  //    Fyers validates limitPrice for ALL order types — for MARKET orders,
+  //    it must be 0 (NOT omitted, NOT any other value).
+  //
+  //    Error this fixes: "limitPrice: Must be greater than or equal to 0.0025"
+  //    happened because type:1 (LIMIT) was used with limitPrice:0.
+  // FYERS ORDER TAG RULES
+  // ---------------------
+  // Fyers allows ONLY alphanumeric characters in orderTag (no hyphens,
+  // underscores, spaces, or special chars). Max length is 25 chars.
+  //
+  // We use the format "tg<messageId>" (e.g. "tg21") for idempotency —
+  // if the same Telegram message is re-processed, the order book check
+  // will find the existing order with the same tag and skip re-placing.
   const orderTag = signal.messageId
-    ? `tg-${signal.messageId}`
-    : `tg-${Date.now()}`;
+    ? `tg${signal.messageId}`.slice(0, 25)
+    : `tg${Date.now()}`.slice(0, 25);
   const orderParams: OrderParams = {
     symbol: option.symbol,
     qty,
-    type: 1, // 1 = MARKET order (immediate execution)
+    type: 2, // 2 = MARKET order (immediate execution)
     side: -1, // -1 = SELL (option selling)
     productType: 'INTRADAY',
-    limitPrice: 0, // MARKET order — no limit price
+    limitPrice: 0, // Required by Fyers even for MARKET orders — value 0 is accepted
     stopLoss: 0,
     takeProfit: 0,
     validity: 'DAY',
@@ -242,8 +264,8 @@ export async function executeOrder(
     qty: plan.qty,
     ltp: plan.option.ltp,
     value: plan.orderValue,
-    side: 'SELL',
-    type: 'MARKET',
+    side: plan.orderParams.side === -1 ? 'SELL (-1)' : 'BUY (1)',
+    type: plan.orderParams.type === 2 ? 'MARKET (2)' : plan.orderParams.type === 1 ? 'LIMIT (1)' : `Unknown (${plan.orderParams.type})`,
     tag: plan.orderParams.orderTag,
   });
 
