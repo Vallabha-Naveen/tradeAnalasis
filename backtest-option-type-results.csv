@@ -1,0 +1,46 @@
+filename,valid,skipReason,ocrDetected,ocrConfidence,ocrMethod,ocrText,vlmDetected,vlmConfidence,vlmTextSeen,vlmReasoning,vlmSkipped,agree,truth,ocrCorrect,vlmCorrect,durationMs
+2026-06-01_09-42-01_9672.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,8081
+2026-06-01_11-12-48_9673.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the colored header bar, indicating a Put Option.",false,,,,,2484
+2026-06-01_19-51-44_9674.jpg,false,"insufficient colored pixels (110px, min 300)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,74
+2026-06-02_09-46-02_9676.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,1806
+2026-06-03_09-33-16_9679.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2374
+2026-06-03_10-23-30_9680.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2403
+2026-06-04_09-40-42_9682.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible next to the instrument name in the header bar.",false,,,,,2946
+2026-06-04_09-52-30_9683.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2274
+2026-06-05_09-38-22_9686.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible near the instrument name, indicating a Call Option.",false,,,,,2256
+2026-06-07_12-12-38_9691.jpg,false,"insufficient colored pixels (0px, min 300)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,143
+2026-06-07_18-44-59_9694.jpg,false,"insufficient colored pixels (9px, min 300)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,82
+2026-06-09_09-50-45_9700.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar, indicating a Call Option.",false,,,,,1877
+2026-06-10_10-02-52_9703.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar, indicating a Call Option.",false,,,,,3836
+2026-06-11_09-59-07_9707.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar, indicating a Call Option.",false,,,,,2570
+2026-06-12_09-32-48_9709.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar.",false,,,,,1952
+2026-06-16_09-19-33_9721.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar.",false,,,,,1851
+2026-06-17_10-00-17_9727.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar.",false,,,,,1857
+2026-06-18_10-02-55_9730.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar, indicating a Call Option.",false,,,,,2184
+2026-06-19_09-28-54_9731.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,4901
+2026-06-19_09-56-05_9732.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible near the right side of the header bar, indicating a Put Option.",false,,,,,2255
+2026-06-22_10-04-55_9733.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible near the instrument name in the header.",false,,,,,3268
+2026-06-22_16-07-06_9734.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar, indicating a Call Option.",false,,,,,2660
+2026-06-23_09-21-45_9735.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2730
+2026-06-24_09-40-40_9736.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible near the instrument name on the right side of the header bar.",false,,,,,2555
+2026-06-25_09-32-20_9738.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar, indicating a Call Option.",false,,,,,2416
+2026-06-25_10-56-46_9739.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"50 CE","The text '50 CE' is visible near the right side of the header, indicating a Call Option.",false,,,,,3168
+2026-06-29_09-33-16_9746.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2615
+2026-06-29_09-46-54_9747.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2907
+2026-06-30_09-28-46_9749.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2723
+2026-06-30_09-58-24_9750.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2671
+2026-07-01_09-19-12_9755.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible near the instrument name in the header.",false,,,,,2417
+2026-07-01_09-53-14_9756.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2269
+2026-07-01_21-01-09_9761.jpg,false,"landscape orientation (1024x559)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,17
+2026-07-02_09-28-22_9763.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the colored header bar, indicating a Call Option.",false,,,,,3996
+2026-07-02_10-01-56_9764.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar, indicating a Call Option.",false,,,,,2850
+2026-07-03_09-33-26_9769.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2234
+2026-07-03_11-51-09_9770.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2485
+2026-07-06_10-07-31_9773.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible on the right side of the header bar.",false,,,,,1947
+2026-07-06_10-38-09_9774.jpg,true,"",UNKNOWN,0,disabled,"",CE,95,"CE","The text 'CE' is clearly visible next to the instrument name in the header.",false,,,,,3997
+2026-07-07_09-44-06_9776.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,2567
+2026-07-07_22-07-18_9778.jpg,false,"colored area too wide (97.3%, max 70%)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,150
+2026-07-07_22-07-18_9779.jpg,false,"insufficient colored pixels (112px, min 300)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,163
+2026-07-07_22-07-18_9780.jpg,false,"insufficient colored pixels (112px, min 300)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,170
+2026-07-07_22-08-01_9781.jpg,false,"insufficient colored pixels (0px, min 300)",UNKNOWN,0,skipped,"",UNKNOWN,0,"","",true,,,,,113
+2026-07-08_09-47-44_9787.jpg,true,"",UNKNOWN,0,disabled,"",PE,95,"PE","The text 'PE' is clearly visible on the right side of the header bar, indicating a Put Option.",false,,,,,6950

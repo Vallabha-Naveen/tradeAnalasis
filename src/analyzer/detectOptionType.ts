@@ -32,6 +32,7 @@ import { clampConfidence } from './confidence.js';
 import type { OptionType } from '../models/Trade.js';
 import { recognizeBuffer } from './ocr.js';
 import { extractBarMetrics } from './detectSymbol.js';
+import type { UnifiedHeaderOcrResult } from './unifiedHeaderOcr.js';
 
 // ---------------------------------------------------------------------------
 // Pixel classification
@@ -383,6 +384,47 @@ async function ocrFullWidthNarrowBands(
   if (ceVotes >= 2 && ceVotes > peVotes) return 'CE';
   if (peVotes >= 2 && peVotes > ceVotes) return 'PE';
   return null;
+}
+
+// ---------------------------------------------------------------------------
+// Single-pass detection from unified OCR
+// ---------------------------------------------------------------------------
+
+/**
+ * Detect CE/PE from unified header OCR results.
+ *
+ * This is the optimized version that parses CE/PE from the single OCR pass
+ * that was already run for symbol detection. It uses relaxed parsing since
+ * the header may contain other text.
+ *
+ * Returns null if CE/PE cannot be confidently determined from the header OCR.
+ */
+export function detectOptionTypeFromHeaderOcr(
+  ocrResult: UnifiedHeaderOcrResult,
+): DetectionScore<OptionType> {
+  try {
+    const { fullText } = ocrResult;
+
+    if (!fullText || fullText.length === 0) {
+      logger.debug('Single-pass CE/PE: no text in header OCR');
+      return { value: null, confidence: 0, method: 'ocr-single-pass' };
+    }
+
+    // Use relaxed parsing for the full header text
+    const parsed = parseOptionType(fullText, false);
+
+    if (parsed) {
+      logger.debug(`Single-pass CE/PE: detected ${parsed} from header text`);
+      // Give moderate confidence since this is a single-pass approach
+      return { value: parsed, confidence: 60, method: 'ocr-single-pass' };
+    }
+
+    logger.debug('Single-pass CE/PE: no CE/PE found in header text');
+    return { value: null, confidence: 0, method: 'ocr-single-pass' };
+  } catch (err) {
+    logger.error('Single-pass CE/PE detection failed', { error: String(err) });
+    return { value: null, confidence: 0, method: 'ocr-single-pass' };
+  }
 }
 
 // ---------------------------------------------------------------------------

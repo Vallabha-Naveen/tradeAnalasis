@@ -23,6 +23,7 @@ import path from 'path';
 import { logger } from '../utils/logger.js';
 import type { DetectionScore } from './confidence.js';
 import { clampConfidence } from './confidence.js';
+import type { UnifiedHeaderOcrResult } from './unifiedHeaderOcr.js';
 
 // ---------------------------------------------------------------------------
 // Types
@@ -256,10 +257,94 @@ export async function measureWhitespace(imagePath: string): Promise<WhitespaceMe
 // ---------------------------------------------------------------------------
 
 /**
+ * Classify symbol based on remaining whitespace ratio using pre-computed OCR.
+ *
+ * This is the optimized version that accepts unified OCR results to avoid
+ * running OCR multiple times.
+ */
+export function detectByWhitespaceFromOcr(
+  ocrResult: UnifiedHeaderOcrResult,
+): DetectionScore<string> {
+  try {
+    const { imageWidth, words } = ocrResult;
+
+    if (words.length === 0) {
+      logger.debug('Whitespace detection: no OCR words found in header');
+      return { value: null, confidence: 0, method: 'whitespace' };
+    }
+
+    // Find the rightmost word: the one with the highest x1 value
+    let rightMostWord: OcrWord | null = null;
+    let rightMostX = 0;
+
+    for (const word of words) {
+      if (word.x1 > rightMostX) {
+        rightMostX = word.x1;
+        rightMostWord = word;
+      }
+    }
+
+    const remainingWhitespace = imageWidth - rightMostX;
+    const remainingWhitespaceRatio = imageWidth > 0 ? remainingWhitespace / imageWidth : 0;
+
+    logger.debug(
+      `Whitespace from OCR: width=${imageWidth} rightX=${rightMostX} ` +
+        `ws=${remainingWhitespace}px ratio=${remainingWhitespaceRatio.toFixed(4)} ` +
+        `words=${words.length}` +
+        (rightMostWord ? ` rightWord="${rightMostWord.text}"` : ''),
+    );
+
+    ensureCalibration();
+
+    if (calibration) {
+      // --- Calibrated classification using z-scores ---
+      const nStd = calibration.nifty.stddev || 0.01;
+      const bStd = calibration.banknifty.stddev || 0.01;
+
+      const zNifty = Math.abs(remainingWhitespaceRatio - calibration.nifty.mean) / nStd;
+      const zBank = Math.abs(remainingWhitespaceRatio - calibration.banknifty.mean) / bStd;
+
+      const predicted = zNifty <= zBank ? 'NIFTY' : 'BANKNIFTY';
+      const zDiff = Math.abs(zBank - zNifty);
+
+      // Confidence from z-score separation
+      const confidence = clampConfidence(55 + 38 * (1 - Math.exp(-zDiff * 0.8)));
+
+      logger.debug(
+        `Whitespace calibrated: ratio=${remainingWhitespaceRatio.toFixed(4)} ` +
+          `zN=${zNifty.toFixed(2)} zB=${zBank.toFixed(2)} diff=${zDiff.toFixed(2)} ` +
+          `→ ${predicted} (${confidence}%)`,
+      );
+
+      return { value: predicted, confidence, method: 'whitespace' };
+    }
+
+    // --- Uncalibrated: use hardcoded threshold ---
+    // NIFTY leaves more whitespace (>~25%), BANKNIFTY leaves less
+    const THRESHOLD = 0.25;
+    const predicted = remainingWhitespaceRatio > THRESHOLD ? 'NIFTY' : 'BANKNIFTY';
+    const margin = Math.abs(remainingWhitespaceRatio - THRESHOLD) / THRESHOLD;
+    const confidence = clampConfidence(65 + margin * 25);
+
+    logger.debug(
+      `Whitespace (no calibration): ratio=${remainingWhitespaceRatio.toFixed(4)} ` +
+        `→ ${predicted} (${confidence}%)`,
+    );
+
+    return { value: predicted, confidence, method: 'whitespace' };
+  } catch (err) {
+    logger.error('Whitespace detection failed', { error: String(err) });
+    return { value: null, confidence: 0, method: 'whitespace' };
+  }
+}
+
+/**
  * Classify symbol based on remaining whitespace ratio.
  *
  * Uses calibrated Gaussian distributions when available, otherwise
  * falls back to a hardcoded threshold.
+ *
+ * This is the original version that runs its own OCR. Kept for backward compatibility.
  */
 export async function detectByWhitespace(imagePath: string): Promise<DetectionScore<string>> {
   try {
