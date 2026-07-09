@@ -5,3 +5,4 @@ database/
 downloads/
 .env
 logs/
+config/
