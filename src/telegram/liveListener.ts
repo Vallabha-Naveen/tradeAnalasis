@@ -179,6 +179,8 @@ const orderMutex = new AsyncMutex();
 export interface LiveListenerConfig {
   channelUsername: string;
   enableTrading: boolean;
+  /** Optional: trade manager for post-placement monitoring (SL/target/EOD). */
+  tradeManager?: import('../trade/tradeManager.js').TradeManager | null;
 }
 
 interface EnrichedConfig extends LiveListenerConfig {
@@ -186,6 +188,8 @@ interface EnrichedConfig extends LiveListenerConfig {
   channelId: string;
   /** Which option-type detector to use */
   detector: 'vlm' | 'ocr' | 'vlm-only';
+  /** Trade manager (null if trading disabled) */
+  tradeManager: import('../trade/tradeManager.js').TradeManager | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +205,18 @@ interface EnrichedConfig extends LiveListenerConfig {
 export async function startLiveListener(
   client: TelegramClient,
   config: LiveListenerConfig,
-): Promise<{ tradingEngine: TradingEngine | null; stop: () => Promise<void> }> {
+): Promise<{
+  tradingEngine: TradingEngine | null;
+  stop: () => Promise<void>;
+  /**
+   * Attach (or replace) the trade manager AFTER startLiveListener has
+   * returned. Used by liveTrade.ts to defer manager creation until the
+   * FyersClient is available (it's created inside this function).
+   *
+   * Future trades placed via handleMessage will register with this manager.
+   */
+  attachTradeManager: (tm: import('../trade/tradeManager.js').TradeManager) => void;
+}> {
   logger.info(
     `Starting live listener (phase-1 check every ${CHECK_INTERVAL_MS}ms) for channel: ${config.channelUsername}`,
   );
@@ -299,7 +314,12 @@ export async function startLiveListener(
 
   logger.info(`Option-type detector: ${detector}`);
 
-  const enrichedConfig: EnrichedConfig = { ...config, channelId, detector };
+  const enrichedConfig: EnrichedConfig = {
+    ...config,
+    channelId,
+    detector,
+    tradeManager: config.tradeManager ?? null,
+  };
 
   // 5. Initialize the polling watermark (`lastSeenMessageId`).
   //
@@ -574,7 +594,16 @@ export async function startLiveListener(
     await shutdownOcr();
   };
 
-  return { tradingEngine, stop };
+  /**
+   * Attach (or replace) the trade manager. Mutates enrichedConfig in place
+   * so handleMessage picks it up for subsequent trades.
+   */
+  const attachTradeManager = (tm: import('../trade/tradeManager.js').TradeManager): void => {
+    enrichedConfig.tradeManager = tm;
+    logger.info('Trade manager attached to live listener — future trades will be monitored.');
+  };
+
+  return { tradingEngine, stop, attachTradeManager };
 }
 
 // ---------------------------------------------------------------------------
@@ -594,6 +623,9 @@ async function handleMessage(
   tradingEngine: TradingEngine | null,
   repo: TradeRepository,
 ): Promise<void> {
+  // Convenience accessor for the trade manager (may be null if trading
+  // is disabled or the manager wasn't initialised).
+  const tradeManager = config.tradeManager;
   // 1. Photo-only filter — ignore text/video/sticker/etc.
   //    (Channel filtering is unnecessary here: we polled this specific
   //    channel entity, so every message we receive is from it.)
@@ -697,6 +729,37 @@ async function handleMessage(
 
   if (result.success) {
     logger.info(`Trade executed: ${result.orderId || 'dry-run'}`);
+
+    // ------------------------------------------------------------------
+    // Register the trade with the TradeManager for SL/target/EOD monitoring.
+    // The manager sends the bot notification (if configured) and starts
+    // polling the option LTP. We pass the DB trade.id so the manager can
+    // update exit fields later.
+    // ------------------------------------------------------------------
+    if (tradeManager && result.plan && trade) {
+      try {
+        await tradeManager.registerTrade({
+          tradeId: trade.id,
+          underlying: analysisResult.symbol as 'NIFTY' | 'BANKNIFTY',
+          fyersSymbol: result.plan.option.symbol,
+          strike: result.plan.option.strike,
+          optionType: analysisResult.optionType as 'CE' | 'PE',
+          qty: result.plan.qty,
+          entryPrice: result.plan.option.ltp,
+          fyersOrderId: result.orderId,
+          dryRun: result.dryRun,
+        });
+      } catch (err) {
+        logger.error(
+          `Failed to register trade ${trade.id} with trade manager — position will NOT be monitored!`,
+          { error: errToString(err) },
+        );
+      }
+    } else if (!tradeManager && result.plan) {
+      logger.info(
+        'Trade manager not configured — trade will not be auto-monitored (manual management only)',
+      );
+    }
   } else {
     logger.warn(`Trade execution failed: ${result.message}`);
   }

@@ -60,6 +60,12 @@ export interface TradingEngine {
   processTradeSignal(signal: TradeSignal): Promise<OrderExecutionResult>;
   getAuthUrl(): string;
   shutdown(): void;
+  /**
+   * Return the underlying FyersClient (for use by the trade manager to
+   * poll quotes and place square-off orders). Returns null if the engine
+   * has not been initialized yet.
+   */
+  getClient(): FyersClient | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +348,11 @@ export class DefaultTradingEngine implements TradingEngine {
     logger.info('Shutting down trading engine');
     this.client = null;
     this.isInitialized = false;
+  }
+
+  /** @inheritdoc */
+  getClient(): FyersClient | null {
+    return this.client;
   }
 }
 

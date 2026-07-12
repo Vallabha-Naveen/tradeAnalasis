@@ -210,6 +210,67 @@ export class FyersClient {
     }
   }
 
+  /**
+   * Square off an open short option position by placing an opposite MARKET BUY.
+   *
+   * Used by the trade manager to exit a trade when SL/target/EOD triggers.
+   * The caller passes the SAME symbol + qty as the original SELL — the BUY
+   * nets out the position to zero.
+   *
+   * NOTE: This is NOT the Fyers "exit_position" API. We deliberately place a
+   * fresh MARKET BUY order (with its own order ID) so we get a fill
+   * confirmation back and can record the exit price precisely.
+   *
+   * @param symbol  Fully-qualified Fyers option symbol, e.g. "NSE:NIFTY24N0723500CE"
+   * @param qty     Quantity to buy back (must match the original SELL qty)
+   * @param orderTag Optional tag for audit trail (default: "sqoff-<timestamp>")
+   * @returns       Order ID of the BUY order on success, throws on failure
+   */
+  async squareOffPosition(
+    symbol: string,
+    qty: number,
+    orderTag?: string,
+  ): Promise<string> {
+    const params: OrderParams = {
+      symbol,
+      qty,
+      type: 2, // 2 = MARKET (immediate fill)
+      side: 1, // 1 = BUY (closes the short)
+      productType: 'INTRADAY',
+      limitPrice: 0, // Required by Fyers even for MARKET orders
+      stopLoss: 0,
+      takeProfit: 0,
+      validity: 'DAY',
+      disclosedQty: 0,
+      offlineOrder: false,
+      orderTag: (orderTag || `sqoff${Date.now()}`).slice(0, 25),
+    };
+
+    const response = await this.placeOrder(params);
+    if (response.s !== 'ok' || !response.id) {
+      throw new Error(
+        `Square-off failed for ${symbol} qty=${qty}: ${response.message}`,
+      );
+    }
+    logger.info(
+      `Square-off BUY placed: ${response.id} (symbol: ${symbol}, qty: ${qty})`,
+    );
+    return response.id;
+  }
+
+  /**
+   * Look up a single order by its ID from the order book.
+   *
+   * Returns the raw order object (Fyers shape) or null if not found.
+   * Used by the trade manager to fetch the fill price of a square-off BUY
+   * after it executes.
+   */
+  async getOrderById(orderId: string): Promise<any | null> {
+    const book = await this.getOrderBook();
+    const rawOrders: any[] = book?.orderBook ?? book?.orderBag ?? [];
+    return rawOrders.find((o) => o.id === orderId) ?? null;
+  }
+
   // -------------------------------------------------------------------------
   // Position operations
   // -------------------------------------------------------------------------
@@ -224,6 +285,30 @@ export class FyersClient {
     } finally {
       process.env['NODE_TLS_REJECT_UNAUTHORIZED'] = '1';
     }
+  }
+
+  /**
+   * Get open positions as a Map keyed by symbol — for O(1) lookup.
+   *
+   * Used by the trade manager's resume-on-startup to verify which DB-tracked
+   * trades still have a live Fyers position (vs. were closed externally
+   * during downtime).
+   *
+   * NOTE: Fyers returns net positions. A position with qty=0 means it was
+   * closed today; we filter those out so the map only contains genuinely
+   * open positions.
+   */
+  async getOpenPositionsMap(): Promise<Map<string, Position>> {
+    const positions = await this.getPositions();
+    const map = new Map<string, Position>();
+    for (const p of positions) {
+      // |qty| > 0 means the position is still open. Fyers may return
+      // rows with qty=0 for positions that were closed today — skip those.
+      if (Math.abs(Number(p.qty ?? 0)) > 0) {
+        map.set(p.symbol, p);
+      }
+    }
+    return map;
   }
 
   // -------------------------------------------------------------------------

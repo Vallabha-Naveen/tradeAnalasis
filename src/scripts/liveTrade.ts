@@ -25,7 +25,13 @@ import dotenv from 'dotenv';
 
 import { startLiveListener } from '../telegram/liveListener.js';
 import { authenticate, disconnect } from '../telegram/auth.js';
-import { closeDb } from '../database/db.js';
+import { closeDb, getDb } from '../database/db.js';
+import { TradeRepository } from '../database/tradeRepository.js';
+import { createTradeBotFromEnv, type TradeBot } from '../bot/tradeBot.js';
+import {
+  TradeManager,
+  createTradeManagerConfig,
+} from '../trade/tradeManager.js';
 import type { TradingEngine } from '../fyers/tradingEngine.js';
 import input from 'input';
 
@@ -100,6 +106,8 @@ async function main(): Promise<void> {
 
   let tradingEngine: TradingEngine | null = null;
   let client: Awaited<ReturnType<typeof authenticate>> | null = null;
+  let tradeBot: TradeBot | null = null;
+  let tradeManager: TradeManager | null = null;
   // `stopListener` cancels the polling loop and terminates the OCR worker.
   // We MUST call this BEFORE disconnecting the Telegram client, otherwise
   // an in-flight poll could error out against a dead connection during shutdown.
@@ -112,7 +120,30 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log('\n\nShutting down...');
 
-    // 1. Stop the polling loop FIRST — no more new messages will be fetched.
+    // 0. Stop the trade manager FIRST — no more LTP polls or exit attempts.
+    //    Open positions are NOT auto-closed on shutdown (the user is
+    //    responsible for them; the next session resumes monitoring if we
+    //    add persistence later).
+    if (tradeManager) {
+      try {
+        tradeManager.stop();
+        console.log('Trade manager stopped.');
+      } catch (err) {
+        console.error('Error stopping trade manager:', err);
+      }
+    }
+
+    // 0b. Stop the trade bot (closes its long-polling connection).
+    if (tradeBot) {
+      try {
+        tradeBot.stop();
+        console.log('Trade bot stopped.');
+      } catch (err) {
+        console.error('Error stopping trade bot:', err);
+      }
+    }
+
+    // 1. Stop the polling loop — no more new messages will be fetched.
     //    This also terminates the Tesseract OCR worker thread.
     if (stopListener) {
       try {
@@ -163,12 +194,79 @@ async function main(): Promise<void> {
     console.log('Connecting to Telegram...');
     client = await authenticate();
 
+    // ------------------------------------------------------------------
+    // Start the trade management bot (optional — disabled if BOT_TOKEN
+    // is not set in .env).
+    // ------------------------------------------------------------------
+    tradeBot = createTradeBotFromEnv();
+    if (tradeBot) {
+      console.log('Starting trade management bot...');
+      const botOk = await tradeBot.start();
+      if (botOk) {
+        console.log('Trade bot running. Send /start to your bot in Telegram to verify.');
+      } else {
+        console.log('Trade bot failed to start — trades will self-manage without notifications.');
+        tradeBot = null;
+      }
+    } else {
+      console.log('Trade bot disabled (BOT_TOKEN not set). Trades will self-manage silently.');
+    }
+
+    // ------------------------------------------------------------------
+    // Start the live listener. The trading engine is created INSIDE
+    // startLiveListener, so we pass tradeManager=null for now and
+    // attach it after we have the FyersClient.
+    // ------------------------------------------------------------------
     const result = await startLiveListener(client, {
       channelUsername,
       enableTrading: true,
+      tradeManager: null,
     });
     tradingEngine = result.tradingEngine;
     stopListener = result.stop;
+
+    // ------------------------------------------------------------------
+    // Build the trade manager now that we have the FyersClient.
+    // We access it via a small getter on the trading engine.
+    // ------------------------------------------------------------------
+    if (tradingEngine) {
+      const fyersClient = tradingEngine.getClient();
+      if (fyersClient) {
+        const repo = new TradeRepository(getDb());
+        const mgrCfg = createTradeManagerConfig();
+        tradeManager = new TradeManager(fyersClient, repo, tradeBot, mgrCfg);
+        tradeManager.start();
+        console.log(
+          `Trade manager started (poll every ${mgrCfg.monitorIntervalMs}ms, ` +
+            `EOD at ${mgrCfg.eodSquareOffTime} IST).`,
+        );
+
+        // --------------------------------------------------------------
+        // Resume monitoring of any trades that were open when the
+        // previous process exited. This queries the DB for trades with
+        // no exit_reason, verifies each against Fyers' open positions,
+        // and either re-registers them (position still open) or marks
+        // them as closed-externally (position was closed during downtime).
+        // --------------------------------------------------------------
+        try {
+          const resumeResult = await tradeManager.resumeFromDb();
+          if (resumeResult.resumed > 0 || resumeResult.closedExternally > 0) {
+            console.log(
+              `Resume: ${resumeResult.resumed} trade(s) resumed, ` +
+                `${resumeResult.closedExternally} closed externally, ` +
+                `${resumeResult.skipped} skipped, ${resumeResult.failed} failed.`,
+            );
+          }
+        } catch (err) {
+          console.error('Error resuming trades from DB:', err);
+        }
+
+        // Attach to the live listener so future trades get registered.
+        result.attachTradeManager?.(tradeManager);
+      } else {
+        console.log('Warning: could not obtain FyersClient — trade management disabled');
+      }
+    }
 
     console.log('\nLive trading started. Press Ctrl+C to stop.');
     console.log('Polling channel for trade signals (phase-1 check every 500ms)...\n');
