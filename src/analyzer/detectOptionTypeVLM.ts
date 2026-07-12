@@ -78,7 +78,7 @@ async function getZai(): Promise<any> {
   try {
     const ZAI = (await import('z-ai-web-dev-sdk')).default;
     zaiInstance = await ZAI.create();
-    logger.debug('ZAI VLM SDK initialized');
+    logger.info('ZAI VLM SDK initialized');
     return zaiInstance;
   } catch (err) {
     const errStr = String((err as Error)?.message || err);
@@ -105,9 +105,36 @@ async function getZai(): Promise<any> {
   }
 }
 
+/**
+ * Pre-initialize the ZAI SDK at startup so the first screenshot doesn't
+ * pay the init cost (dynamic import + config load + HTTP client setup,
+ * typically 500-2000ms).
+ *
+ * Call this AFTER `checkVlmAvailability()` confirms the SDK is installed
+ * and configured. If init fails, the error is logged but NOT thrown —
+ * the live listener will retry lazily on the first screenshot and fall
+ * back to OCR if VLM is unavailable.
+ *
+ * Safe to call multiple times — no-ops if already initialized.
+ */
+export async function preInitVlm(): Promise<void> {
+  try {
+    await getZai();
+  } catch (err) {
+    // Don't throw — let the live listener start. The first screenshot
+    // will retry lazily and fall back to OCR if VLM still fails.
+    logger.warn('VLM pre-initialization failed — will retry lazily on first screenshot', {
+      error: String((err as Error)?.message || err),
+    });
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Image preprocessing
 // ---------------------------------------------------------------------------
+
+/** Input type for VLM detection — accepts a file path OR an in-memory Buffer. */
+export type VlmInput = string | Buffer;
 
 /**
  * Crop the header region and convert to base64 PNG.
@@ -117,14 +144,20 @@ async function getZai(): Promise<any> {
  *   - Reduce token usage (lower cost)
  *   - Focus the model's attention on the relevant region
  *   - Avoid the model getting confused by chart content below
+ *
+ * Accepts EITHER a file path OR a Buffer. The Buffer form avoids a disk
+ * read in the live listener (where the image is already in memory from
+ * the Telegram download).
  */
-async function cropHeaderToBase64(imagePath: string): Promise<{ base64: string; mime: string }> {
-  const meta = await sharp(imagePath).metadata();
+async function cropHeaderToBase64(
+  input: VlmInput,
+): Promise<{ base64: string; mime: string }> {
+  const meta = await sharp(input).metadata();
   const W = meta.width!;
   const H = meta.height!;
   const cropH = Math.min(VLM_HEADER_CROP_HEIGHT, H);
 
-  const pngBuffer = await sharp(imagePath)
+  const pngBuffer = await sharp(input)
     .extract({ left: 0, top: 0, width: W, height: cropH })
     .png()
     .toBuffer();
@@ -289,15 +322,16 @@ async function rateLimit(): Promise<void> {
 /**
  * Detect CE/PE using the ZAI Vision LLM.
  *
- * @param imagePath Path to the full screenshot
+ * @param input Path to the full screenshot OR an in-memory Buffer. The Buffer
+ *              form avoids a disk read in the live listener.
  * @returns DetectionScore<OptionType> with confidence and method='vlm'
  */
 export async function detectOptionTypeByVlm(
-  imagePath: string,
+  input: VlmInput,
 ): Promise<DetectionScore<OptionType> & { textSeen?: string; reasoning?: string; rawResponse?: string }> {
   try {
     const zai = await getZai();
-    const { base64, mime } = await cropHeaderToBase64(imagePath);
+    const { base64, mime } = await cropHeaderToBase64(input);
 
     let lastError: Error | null = null;
     for (let attempt = 0; attempt <= VLM_MAX_RETRIES; attempt++) {
@@ -355,7 +389,10 @@ export async function detectOptionTypeByVlm(
 
     throw lastError || new Error('VLM detection failed after retries');
   } catch (err) {
-    logger.error('VLM option type detection failed', { error: String(err), imagePath });
+    logger.error('VLM option type detection failed', {
+      error: String(err),
+      input: typeof input === 'string' ? input : '<Buffer>',
+    });
     return {
       value: null,
       confidence: 0,

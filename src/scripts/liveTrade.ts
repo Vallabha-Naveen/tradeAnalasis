@@ -1,8 +1,10 @@
 /**
  * Live trading script.
  *
- * Starts the live listener that monitors a Telegram channel for trade
- * screenshots and executes them via Fyers API.
+ * Starts the live listener that polls a Telegram channel for new trade
+ * screenshots (phase-1 GetPeerDialogs check every 500 ms, phase-2
+ * GetHistory fetch only when new messages are detected) and executes
+ * them via Fyers API.
  *
  * Usage: npm run live-trade
  *
@@ -13,6 +15,7 @@
  * SHUTDOWN
  * --------
  * Handles both SIGINT (Ctrl+C) and SIGTERM (PM2/Docker stop) gracefully:
+ *   - Stops the polling loop (cancels the next scheduled poll)
  *   - Disconnects Telegram client
  *   - Shuts down trading engine
  *   - Closes the SQLite database (flushes WAL)
@@ -97,6 +100,10 @@ async function main(): Promise<void> {
 
   let tradingEngine: TradingEngine | null = null;
   let client: Awaited<ReturnType<typeof authenticate>> | null = null;
+  // `stopListener` cancels the polling loop and terminates the OCR worker.
+  // We MUST call this BEFORE disconnecting the Telegram client, otherwise
+  // an in-flight poll could error out against a dead connection during shutdown.
+  let stopListener: (() => Promise<void>) | null = null;
   let shuttingDown = false;
 
   // Single cleanup function — idempotent, safe to call from any signal handler.
@@ -105,6 +112,18 @@ async function main(): Promise<void> {
     shuttingDown = true;
     console.log('\n\nShutting down...');
 
+    // 1. Stop the polling loop FIRST — no more new messages will be fetched.
+    //    This also terminates the Tesseract OCR worker thread.
+    if (stopListener) {
+      try {
+        await stopListener();
+        console.log('Polling loop stopped.');
+      } catch (err) {
+        console.error('Error stopping polling loop:', err);
+      }
+    }
+
+    // 2. Shut down the trading engine (cancels any in-flight order mutex).
     if (tradingEngine) {
       try {
         tradingEngine.shutdown();
@@ -114,6 +133,7 @@ async function main(): Promise<void> {
       }
     }
 
+    // 3. Disconnect Telegram — safe now that the polling loop is stopped.
     if (client) {
       try {
         await disconnect(client);
@@ -123,6 +143,7 @@ async function main(): Promise<void> {
       }
     }
 
+    // 4. Close the DB (flushes WAL).
     try {
       closeDb();
       console.log('Database closed.');
@@ -147,11 +168,12 @@ async function main(): Promise<void> {
       enableTrading: true,
     });
     tradingEngine = result.tradingEngine;
+    stopListener = result.stop;
 
     console.log('\nLive trading started. Press Ctrl+C to stop.');
-    console.log('Monitoring channel for trade signals...\n');
+    console.log('Polling channel for trade signals (phase-1 check every 500ms)...\n');
 
-    // Keep the process alive — the Telegram event loop handles everything.
+    // Keep the process alive — the polling loop runs on its own timer.
     // The cleanup handler above will fire on SIGINT/SIGTERM.
   } catch (err) {
     console.error('Fatal error:', err);

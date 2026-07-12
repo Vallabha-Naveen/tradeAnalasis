@@ -17,12 +17,12 @@
  */
 
 import sharp from 'sharp';
-import Tesseract from 'tesseract.js';
 import fs from 'fs';
 import path from 'path';
 import { logger } from '../utils/logger.js';
 import type { DetectionScore } from './confidence.js';
 import { clampConfidence } from './confidence.js';
+import { recognizeRaw } from './ocr.js';
 import type { UnifiedHeaderOcrResult } from './unifiedHeaderOcr.js';
 
 // ---------------------------------------------------------------------------
@@ -124,24 +124,30 @@ function ensureCalibration(): void {
 /** Upscale factor for OCR — Tesseract needs larger text to detect small fonts */
 const OCR_UPSCALE = 4;
 
+/** Input type — accepts a file path string or an in-memory Buffer. */
+export type WhitespaceInput = string | Buffer;
+
 /**
  * Crop the header area and return BOTH the original-size crop (for geometry
  * calculations) and an upscaled version (for OCR to detect small text).
+ *
+ * Accepts EITHER a file path OR a Buffer. The Buffer form avoids a disk
+ * read in the live listener.
  */
 async function cropHeader(
-  imagePath: string,
+  input: WhitespaceInput,
 ): Promise<{
   width: number;
   height: number;
   upscaledBuffer: Buffer;
 }> {
-  const meta = await sharp(imagePath).metadata();
+  const meta = await sharp(input).metadata();
   const W = meta.width!;
   const H = meta.height!;
   const cropH = Math.min(HEADER_CROP_HEIGHT, H);
 
   // Upscale the crop for better OCR detection of small text
-  const upscaledBuffer = await sharp(imagePath)
+  const upscaledBuffer = await sharp(input)
     .extract({ left: 0, top: 0, width: W, height: cropH })
     .resize(W * OCR_UPSCALE, cropH * OCR_UPSCALE, { kernel: 'lanczos2' })
     .png()
@@ -165,9 +171,7 @@ async function cropHeader(
  * whitespace measurement.
  */
 async function ocrHeaderWithBoxes(upscaledBuffer: Buffer): Promise<OcrWord[]> {
-  const result = await Tesseract.recognize(upscaledBuffer, 'eng', {
-    logger: () => {},
-  });
+  const result = await recognizeRaw(upscaledBuffer);
 
   // Tesseract v5: result.data.words[i].bbox = { x0, y0, x1, y1 }
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -212,11 +216,13 @@ async function ocrHeaderWithBoxes(upscaledBuffer: Buffer): Promise<OcrWord[]> {
  * That's it. No row grouping, no status bar filtering, no cluster analysis.
  * Just the single rightmost text in the entire header.
  */
-export async function measureWhitespace(imagePath: string): Promise<WhitespaceMeasurement> {
-  const meta = await sharp(imagePath).metadata();
+export async function measureWhitespace(
+  input: WhitespaceInput,
+): Promise<WhitespaceMeasurement> {
+  const meta = await sharp(input).metadata();
   const imageWidth = meta.width!;
 
-  const { height: headerHeight, upscaledBuffer } = await cropHeader(imagePath);
+  const { height: headerHeight, upscaledBuffer } = await cropHeader(input);
   const allWords = await ocrHeaderWithBoxes(upscaledBuffer);
 
   // Find the rightmost word: the one with the highest x1 value
@@ -241,7 +247,7 @@ export async function measureWhitespace(imagePath: string): Promise<WhitespaceMe
   );
 
   return {
-    imagePath,
+    imagePath: typeof input === 'string' ? input : '<Buffer>',
     imageWidth,
     headerHeight,
     allWords,
@@ -346,9 +352,11 @@ export function detectByWhitespaceFromOcr(
  *
  * This is the original version that runs its own OCR. Kept for backward compatibility.
  */
-export async function detectByWhitespace(imagePath: string): Promise<DetectionScore<string>> {
+export async function detectByWhitespace(
+  input: WhitespaceInput,
+): Promise<DetectionScore<string>> {
   try {
-    const m = await measureWhitespace(imagePath);
+    const m = await measureWhitespace(input);
 
     if (m.allWords.length === 0 || m.rightMostX === 0) {
       logger.debug('Whitespace detection: no OCR words found in header');

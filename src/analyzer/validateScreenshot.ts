@@ -10,18 +10,27 @@
  *   2. Minimum height (800px)
  *   3. Aspect ratio 0.30–0.75 (typical phone screenshot)
  *   4. Presence of a contiguous colored header bar (30%–70% of width)
+ *
+ * Accepts EITHER a file path OR a Buffer. The Buffer form avoids a disk
+ * read in the live listener (where the image is already in memory from
+ * the Telegram download).
  */
 
 import sharp from 'sharp';
+
+/** Input type — accepts a file path string or an in-memory Buffer. */
+export type ScreenshotInput = string | Buffer;
 
 export interface ValidationResult {
   valid: boolean;
   reason?: string;
 }
 
-export async function validateScreenshot(imagePath: string): Promise<ValidationResult> {
+export async function validateScreenshot(
+  input: ScreenshotInput,
+): Promise<ValidationResult> {
   try {
-    const meta = await sharp(imagePath).metadata();
+    const meta = await sharp(input).metadata();
     const W = meta.width ?? 0;
     const H = meta.height ?? 0;
 
@@ -43,7 +52,7 @@ export async function validateScreenshot(imagePath: string): Promise<ValidationR
 
     // Gate 4: Multi-row contiguous colored bar detection
     const scanH = Math.min(200, H);
-    const raw = await sharp(imagePath)
+    const raw = await sharp(input)
       .extract({ left: 0, top: 0, width: W, height: scanH })
       .removeAlpha()
       .raw()

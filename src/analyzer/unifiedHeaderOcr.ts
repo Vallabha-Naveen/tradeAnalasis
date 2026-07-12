@@ -6,12 +6,19 @@
  *   - Option type detection (via parsing CE/PE from header text)
  *
  * This optimization reduces OCR calls from ~46 per image to 1-2 calls.
+ *
+ * Accepts EITHER a file path OR a Buffer. The Buffer form avoids a disk
+ * read in the live listener (where the image is already in memory from
+ * the Telegram download).
  */
 
 import sharp from 'sharp';
-import Tesseract from 'tesseract.js';
 import { logger } from '../utils/logger.js';
+import { recognizeRaw } from './ocr.js';
 import type { OcrWord } from './detectSymbolByWhitespace.js';
+
+/** Input type — accepts a file path string or an in-memory Buffer. */
+export type HeaderOcrInput = string | Buffer;
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -47,24 +54,27 @@ export interface UnifiedHeaderOcrResult {
  *
  * This crops the header (top 100px), upscales it 4x for better text detection,
  * runs OCR once, and returns both the word-level bounding boxes and the full text.
+ *
+ * @param input - File path OR in-memory Buffer. Buffer form avoids a disk
+ *                read in the live listener.
  */
-export async function ocrHeaderOnce(imagePath: string): Promise<UnifiedHeaderOcrResult> {
-  const meta = await sharp(imagePath).metadata();
+export async function ocrHeaderOnce(
+  input: HeaderOcrInput,
+): Promise<UnifiedHeaderOcrResult> {
+  const meta = await sharp(input).metadata();
   const W = meta.width!;
   const H = meta.height!;
   const cropH = Math.min(HEADER_CROP_HEIGHT, H);
 
   // Upscale the crop for better OCR detection of small text
-  const upscaledBuffer = await sharp(imagePath)
+  const upscaledBuffer = await sharp(input)
     .extract({ left: 0, top: 0, width: W, height: cropH })
     .resize(W * OCR_UPSCALE, cropH * OCR_UPSCALE, { kernel: 'lanczos2' })
     .png()
     .toBuffer();
 
-  // Run OCR once
-  const result = await Tesseract.recognize(upscaledBuffer, 'eng', {
-    logger: () => {},
-  });
+  // Run OCR once using the shared reusable worker
+  const result = await recognizeRaw(upscaledBuffer);
 
   // Extract word-level bounding boxes
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
