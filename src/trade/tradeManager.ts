@@ -123,6 +123,20 @@ export class TradeManager {
   /** True once EOD square-off has fired (prevents re-firing every tick after 15:15). */
   private eodFired = false;
 
+  /** Tick counter for periodic position reconciliation. */
+  private tickCount = 0;
+
+  /**
+   * Run position reconciliation every N ticks.
+   *
+   * At the default 1.5s interval, 10 ticks ≈ 15 seconds. This adds one
+   * getPositions() API call every 15s — negligible load. The reconciliation
+   * catches manual closes / external exits that happen between SL/target
+   * checks, so the program doesn't keep polling LTP for a dead position
+   * and fire a spurious BUY when SL/target is eventually hit.
+   */
+  private readonly RECONCILE_EVERY_N_TICKS = 10;
+
   constructor(
     fyersClient: FyersClient,
     repo: TradeRepository,
@@ -137,6 +151,7 @@ export class TradeManager {
     // Register the toggle callback so the bot can call into us
     if (this.bot) {
       this.bot.onToggle(async (tradeId, newMode) => this.setMode(tradeId, newMode));
+      this.bot.onForceClose(async (tradeId) => this.forceClose(tradeId));
     }
   }
 
@@ -229,6 +244,23 @@ export class TradeManager {
     let botMessageId: number | null = null;
     if (this.bot) {
       botMessageId = await this.bot.sendTradePlaced(managed.notification);
+      if (botMessageId === null) {
+        // Bot was running but sendMessage failed — sendTradePlaced
+        // already logged the error. Warn here too so it's visible at
+        // warn level in the console.
+        logger.warn(
+          `TradeManager: trade ${input.tradeId} placed but bot notification FAILED to send. ` +
+            'Check the error log above. The trade WILL still be monitored.',
+        );
+      }
+    } else {
+      logger.warn(
+        `TradeManager: trade ${input.tradeId} placed but NO bot is configured — ` +
+          'no Telegram notification will be sent.\n' +
+          '  → To enable notifications, set BOT_TOKEN and TELEGRAM_USER_ID in .env,\n' +
+          '    send /start to your bot in Telegram, then restart.\n' +
+          '  → The trade WILL still be monitored (SL/target/EOD) by the program.',
+      );
     }
     managed.botMessageId = botMessageId;
 
@@ -319,6 +351,15 @@ export class TradeManager {
         logger.info(
           `TradeManager: resume — Fyers reports ${fyersPositions.size} open position(s)`,
         );
+        // Log each position for debugging — helps diagnose why a trade
+        // was resumed vs. marked closed-externally
+        if (fyersPositions.size > 0) {
+          for (const [sym, pos] of fyersPositions) {
+            logger.info(
+              `TradeManager: resume — Fyers position: ${sym} qty=${pos.qty} pnl=${pos.pnl}`,
+            );
+          }
+        }
       } catch (err) {
         logger.error(
           'TradeManager: resume — failed to fetch Fyers positions; will assume all DB trades are still open (risky)',
@@ -327,6 +368,17 @@ export class TradeManager {
         // If we can't verify, assume all are open — safer than marking
         // everything closed-externally (which would lose monitoring).
       }
+    }
+
+    // Log each DB trade and whether it was found in Fyers positions
+    for (const ot of openTrades) {
+      const inFyers = fyersPositions.has(ot.fyersSymbol);
+      const fyersQty = inFyers ? fyersPositions.get(ot.fyersSymbol)?.qty : 'N/A';
+      logger.info(
+        `TradeManager: resume — DB trade ${ot.id}: ${ot.fyersSymbol} ` +
+          `DB_qty=${ot.quantity} dryRun=${ot.dryRun} ` +
+          `inFyers=${inFyers} fyersQty=${fyersQty}`,
+      );
     }
 
     for (const ot of openTrades) {
@@ -569,6 +621,74 @@ export class TradeManager {
   }
 
   // -------------------------------------------------------------------------
+  // Force close (manual override)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Force-close a trade — mark it as EXITED WITHOUT placing a BUY order.
+   *
+   * Use this when:
+   *   - You've already closed the position manually in the Fyers app
+   *   - The position was auto-squared-off by Fyers (e.g. EOD)
+   *   - The reconciliation failed to detect the close
+   *   - You want to stop monitoring for any reason
+   *
+   * The trade is marked as EXITED with reason='MANUAL'. No BUY order is
+   * placed — this is purely a bookkeeping operation. P&L is computed using
+   * the current LTP (best-effort).
+   *
+   * @param tradeId DB trade ID
+   * @returns success/failure result
+   */
+  async forceClose(tradeId: number): Promise<{ success: boolean; reason?: string }> {
+    const trade = this.trades.get(tradeId);
+    if (!trade) {
+      return { success: false, reason: 'Trade not found (may have been closed already or never registered)' };
+    }
+    if (trade.status === 'EXITED') {
+      return { success: false, reason: 'Trade already closed' };
+    }
+
+    // Fetch current LTP for best-effort P&L
+    const ltp = await this.fetchLtpSafe(trade.fyersSymbol);
+    const exitPrice = ltp > 0 ? ltp : trade.entryPrice;
+    const pnl = (trade.entryPrice - exitPrice) * trade.qty;
+
+    trade.status = 'EXITED';
+
+    // Update DB
+    this.repo.updateTradeExit(tradeId, {
+      exitPrice,
+      exitTime: new Date().toISOString(),
+      exitReason: 'MANUAL',
+      realizedPnl: pnl,
+    });
+
+    // Edit bot message to final state
+    if (this.bot && trade.botMessageId) {
+      await this.bot
+        .editTradeMessageExited(tradeId, trade.botMessageId, trade.notification, {
+          reason: 'MANUAL',
+          exitPrice,
+          pnl,
+          mode: trade.mode,
+        })
+        .catch((err) => {
+          logger.debug('TradeManager: forceClose — bot edit failed', {
+            error: errToString(err),
+            tradeId,
+          });
+        });
+    }
+
+    logger.info(
+      `TradeManager: trade ${tradeId} FORCE-CLOSED — reason=MANUAL ` +
+        `exit=₹${exitPrice.toFixed(2)} P&L=${pnl >= 0 ? '+' : ''}₹${pnl.toFixed(2)}`,
+    );
+    return { success: true };
+  }
+
+  // -------------------------------------------------------------------------
   // Background polling loop
   // -------------------------------------------------------------------------
 
@@ -599,11 +719,16 @@ export class TradeManager {
   /**
    * One polling iteration:
    *   1. Check EOD — if past EOD time, exit all program-managed trades.
-   *   2. Otherwise, batch-fetch LTPs for all open PROGRAM trades and check SL/target.
+   *   2. Periodically (every N ticks) reconcile positions with Fyers —
+   *      detect trades that were closed externally (manually by user, or
+   *      auto-squared-off) so we don't keep monitoring dead positions.
+   *   3. Batch-fetch LTPs for all open PROGRAM trades and check SL/target.
    */
   private async pollOnce(): Promise<void> {
     const openTrades = Array.from(this.trades.values()).filter((t) => t.status === 'OPEN');
     if (openTrades.length === 0) return;
+
+    this.tickCount++;
 
     // ----- EOD check -----
     if (this.isPastEod() && !this.eodFired) {
@@ -637,8 +762,23 @@ export class TradeManager {
       return;
     }
 
+    // ----- Periodic position reconciliation -----
+    // Every N ticks, fetch all open Fyers positions and check whether each
+    // of our tracked trades still has a matching position. If not, the
+    // position was closed externally (manually by user, or auto-squared-off
+    // by Fyers). Mark those trades as EXITED with reason=EXTERNAL so we
+    // don't keep polling LTP for a dead position — and more importantly,
+    // don't fire a spurious BUY when SL/target is eventually hit.
+    let currentOpenTrades = openTrades;
+    if (this.tickCount % this.RECONCILE_EVERY_N_TICKS === 0) {
+      await this.reconcilePositions(openTrades);
+      // Re-filter after reconciliation (some trades may have been marked EXITED)
+      currentOpenTrades = Array.from(this.trades.values()).filter((t) => t.status === 'OPEN');
+      if (currentOpenTrades.length === 0) return;
+    }
+
     // ----- SL / target check -----
-    const programTrades = openTrades.filter((t) => t.mode === 'PROGRAM');
+    const programTrades = currentOpenTrades.filter((t) => t.mode === 'PROGRAM');
     if (programTrades.length === 0) return;
 
     // Batch-fetch LTPs in one call
@@ -682,6 +822,92 @@ export class TradeManager {
   }
 
   /**
+   * Reconcile tracked trades against Fyers' open positions.
+   *
+   * For each tracked OPEN trade (both PROGRAM and MANUAL mode), check if
+   * Fyers still reports an open position for that symbol. If not, the
+   * position was closed externally — mark the trade as EXITED with
+   * reason=EXTERNAL.
+   *
+   * This catches:
+   *   - User manually closed the position in the Fyers app
+   *   - Fyers auto-squared-off the position (e.g. weekly expiry settlement)
+   *   - Another program/script closed the position
+   *
+   * Without this, the trade manager would keep polling LTP for a dead
+   * position and — critically — fire a spurious MARKET BUY when SL/target
+   * is eventually hit, OPENING A NEW LONG POSITION. That's a real-money bug.
+   *
+   * Dry-run trades are skipped (no real Fyers position to verify).
+   */
+  private async reconcilePositions(trades: ManagedTrade[]): Promise<void> {
+    // Only reconcile real (non-dry-run) trades that are still OPEN
+    const realTrades = trades.filter((t) => !t.dryRun && t.status === 'OPEN');
+    if (realTrades.length === 0) return;
+
+    let positions: Map<string, { qty: number; pnl: number }>;
+    try {
+      positions = await this.fyersClient.getOpenPositionsMap();
+    } catch (err) {
+      logger.warn('TradeManager: reconcile — failed to fetch positions, skipping this tick', {
+        error: errToString(err),
+      });
+      return;
+    }
+
+    for (const trade of realTrades) {
+      // Re-check status — a previous iteration in this loop may have exited it
+      if (trade.status === 'EXITED') continue;
+
+      const pos = positions.get(trade.fyersSymbol);
+      const posQty = pos ? Math.abs(Number(pos.qty ?? 0)) : 0;
+
+      if (!pos || posQty < trade.qty) {
+        // Position is gone (or partially closed). Mark as EXTERNAL exit.
+        logger.info(
+          `TradeManager: reconcile — trade ${trade.tradeId} (${trade.fyersSymbol}) ` +
+            `position no longer open on Fyers (expected qty=${trade.qty}, found qty=${posQty}). ` +
+            `Marking as EXTERNAL exit — user likely closed manually.`,
+        );
+
+        // Fetch current LTP for best-effort exit price + P&L
+        const ltp = await this.fetchLtpSafe(trade.fyersSymbol);
+        const exitPrice = ltp > 0 ? ltp : trade.entryPrice;
+        const pnl = (trade.entryPrice - exitPrice) * trade.qty;
+
+        trade.status = 'EXITED';
+        this.repo.updateTradeExit(trade.tradeId, {
+          exitPrice,
+          exitTime: new Date().toISOString(),
+          exitReason: 'EXTERNAL',
+          realizedPnl: pnl,
+        });
+
+        if (this.bot && trade.botMessageId) {
+          await this.bot
+            .editTradeMessageExited(trade.tradeId, trade.botMessageId, trade.notification, {
+              reason: 'EXTERNAL',
+              exitPrice,
+              pnl,
+              mode: trade.mode,
+            })
+            .catch((err) => {
+              logger.debug('TradeManager: reconcile — bot edit failed', {
+                error: errToString(err),
+                tradeId: trade.tradeId,
+              });
+            });
+        }
+
+        logger.info(
+          `TradeManager: trade ${trade.tradeId} EXITED via reconcile — reason=EXTERNAL ` +
+            `exit=₹${exitPrice.toFixed(2)} P&L=${pnl >= 0 ? '+' : ''}₹${pnl.toFixed(2)}`,
+        );
+      }
+    }
+  }
+
+  /**
    * Exit a single trade: place MARKET BUY, mark EXITED, update DB, edit bot message.
    * Serialized via exitMutex to prevent overlapping Fyers calls.
    *
@@ -714,36 +940,78 @@ export class TradeManager {
             `(${trade.fyersSymbol} qty=${trade.qty} @ ~₹${exitPrice.toFixed(2)}, reason=${reason})`,
         );
       } else {
+        // ----------------------------------------------------------------
+        // CRITICAL: Verify the position is still open before placing BUY.
+        // The user may have closed it manually in the Fyers app. If we
+        // place a BUY without checking, we'd OPEN A NEW LONG POSITION
+        // instead of closing the short — that's a real-money bug.
+        // ----------------------------------------------------------------
+        let positionStillOpen = true;
         try {
-          buyOrderId = await this.fyersClient.squareOffPosition(
-            trade.fyersSymbol,
-            trade.qty,
-            `exit${trade.tradeId}`.slice(0, 25),
-          );
-          // Try to fetch the actual fill price from the order book.
-          // MARKET orders fill near-instantly, but the order book may
-          // take a moment to update — retry once after 500ms.
-          exitPrice = await this.fetchFillPrice(buyOrderId);
-          if (exitPrice === 0) {
-            await new Promise((r) => setTimeout(r, 500));
-            exitPrice = await this.fetchFillPrice(buyOrderId);
-          }
-          if (exitPrice === 0) {
-            // Could not get fill price — fall back to trigger LTP
-            logger.warn(
-              `TradeManager: could not fetch fill price for order ${buyOrderId}, using trigger LTP`,
-            );
-            exitPrice = triggerLtp ?? trade.entryPrice;
+          const positions = await this.fyersClient.getOpenPositionsMap();
+          const pos = positions.get(trade.fyersSymbol);
+          // Position is considered "still open" if it exists AND has
+          // at least the expected qty. Partial closes (|qty| < trade.qty)
+          // are treated as "closed" to avoid over-closing.
+          if (!pos || Math.abs(Number(pos.qty ?? 0)) < trade.qty) {
+            positionStillOpen = false;
           }
         } catch (err) {
-          logger.error(
-            `TradeManager: square-off FAILED for trade ${trade.tradeId} — position may still be open!`,
+          // If we can't verify, proceed with the BUY — better to attempt
+          // the close than to skip it (if the position IS still open,
+          // skipping would leave it unmanaged). Log a warning.
+          logger.warn(
+            `TradeManager: could not verify position for trade ${trade.tradeId} ` +
+              `before exit — proceeding with BUY anyway (risk: position may already be closed)`,
             { error: errToString(err) },
           );
-          // Don't mark as EXITED — leave it OPEN so the next tick can retry.
-          // Update the bot message to warn the user.
-          // (We intentionally do NOT change status here.)
-          return;
+        }
+
+        if (!positionStillOpen) {
+          // Position was closed externally (user closed manually, or
+          // Fyers auto-squared-off). Do NOT place a BUY. Mark as
+          // EXTERNAL exit with the trigger LTP as best-effort exit price.
+          logger.info(
+            `TradeManager: position for trade ${trade.tradeId} (${trade.fyersSymbol}) ` +
+              `is NO LONGER OPEN — skipping BUY (user likely closed manually). ` +
+              `Marking as EXTERNAL exit.`,
+          );
+          exitPrice = triggerLtp ?? (await this.fetchLtpSafe(trade.fyersSymbol)) ?? trade.entryPrice;
+
+          // Fall through to the common exit-recording path below with
+          // reason overridden to EXTERNAL and buyOrderId staying null.
+          reason = 'EXTERNAL';
+        } else {
+          // Position is still open — proceed with the BUY.
+          try {
+            buyOrderId = await this.fyersClient.squareOffPosition(
+              trade.fyersSymbol,
+              trade.qty,
+              `exit${trade.tradeId}`.slice(0, 25),
+            );
+            // Try to fetch the actual fill price from the order book.
+            // MARKET orders fill near-instantly, but the order book may
+            // take a moment to update — retry once after 500ms.
+            exitPrice = await this.fetchFillPrice(buyOrderId);
+            if (exitPrice === 0) {
+              await new Promise((r) => setTimeout(r, 500));
+              exitPrice = await this.fetchFillPrice(buyOrderId);
+            }
+            if (exitPrice === 0) {
+              // Could not get fill price — fall back to trigger LTP
+              logger.warn(
+                `TradeManager: could not fetch fill price for order ${buyOrderId}, using trigger LTP`,
+              );
+              exitPrice = triggerLtp ?? trade.entryPrice;
+            }
+          } catch (err) {
+            logger.error(
+              `TradeManager: square-off FAILED for trade ${trade.tradeId} — position may still be open!`,
+              { error: errToString(err) },
+            );
+            // Don't mark as EXITED — leave it OPEN so the next tick can retry.
+            return;
+          }
         }
       }
 

@@ -54,6 +54,19 @@ const VLM_CALL_DELAY_MS = parseInt(process.env['VLM_CALL_DELAY_MS'] || '500');
 const VLM_MAX_RETRIES = 2;
 
 /**
+ * Backoff for 429 rate-limit errors (ms).
+ * 429s need a longer wait than transient network errors — the API is
+ * explicitly telling us to slow down. 20s aligns with the free-tier
+ * 3 RPM limit (1 call / 20s).
+ */
+const VLM_RATE_LIMIT_BACKOFF_MS = parseInt(
+  process.env['VLM_RATE_LIMIT_BACKOFF_MS'] || '20000',
+);
+
+/** Backoff for other transient errors (ms, multiplied by attempt). */
+const VLM_TRANSIENT_BACKOFF_MS = 1000;
+
+/**
  * Vision model to use.
  *
  * BigModel (Zhipu AI) public API supports:
@@ -379,10 +392,28 @@ export async function detectOptionTypeByVlm(
         };
       } catch (err) {
         lastError = err as Error;
-        logger.warn(`VLM attempt ${attempt + 1} failed: ${String(err)}`);
-        // Exponential backoff before retry
-        if (attempt < VLM_MAX_RETRIES) {
-          await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
+        const errStr = String(err).toLowerCase();
+        const isRateLimit =
+          errStr.includes('429') ||
+          errStr.includes('rate limit') ||
+          errStr.includes('too many requests');
+
+        if (isRateLimit) {
+          logger.warn(
+            `VLM attempt ${attempt + 1} hit rate limit (429). ` +
+              `Waiting ${VLM_RATE_LIMIT_BACKOFF_MS}ms before retry. ` +
+              `Consider upgrading your BigModel tier or increasing VLM_CALL_DELAY_MS in .env.`,
+          );
+          if (attempt < VLM_MAX_RETRIES) {
+            await new Promise((r) => setTimeout(r, VLM_RATE_LIMIT_BACKOFF_MS));
+          }
+        } else {
+          logger.warn(`VLM attempt ${attempt + 1} failed: ${String(err)}`);
+          if (attempt < VLM_MAX_RETRIES) {
+            await new Promise((r) =>
+              setTimeout(r, VLM_TRANSIENT_BACKOFF_MS * (attempt + 1)),
+            );
+          }
         }
       }
     }

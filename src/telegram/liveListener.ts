@@ -103,6 +103,12 @@ import {
   checkVlmAvailability,
   preInitVlm,
 } from '../analyzer/detectOptionTypeVLM.js';
+import {
+  checkGoogleVisionAvailability,
+  preInitGoogleVision,
+  ocrHeaderWithGoogleVision,
+} from '../analyzer/googleVisionOcr.js';
+import { detectOptionTypeByGoogleVisionFromText } from '../analyzer/detectOptionTypeByGoogleVision.js';
 import { preInitOcr, shutdownOcr } from '../analyzer/ocr.js';
 import { clampConfidence, type DetectionScore } from '../analyzer/confidence.js';
 import { createTradingEngine, createTradeSignal } from '../fyers/tradingEngine.js';
@@ -187,7 +193,7 @@ interface EnrichedConfig extends LiveListenerConfig {
   /** Resolved numeric channel ID (as string) — used for DB scoping */
   channelId: string;
   /** Which option-type detector to use */
-  detector: 'vlm' | 'ocr' | 'vlm-only';
+  detector: 'vlm' | 'ocr' | 'vlm-only' | 'google-vision';
   /** Trade manager (null if trading disabled) */
   tradeManager: import('../trade/tradeManager.js').TradeManager | null;
 }
@@ -276,11 +282,29 @@ export async function startLiveListener(
 
   // 4. Determine which detector to use
   const detectorCfg = (process.env['OPTION_TYPE_DETECTOR'] || 'vlm').toLowerCase().trim();
-  let detector: 'vlm' | 'ocr' | 'vlm-only' = 'vlm';
+  let detector: 'vlm' | 'ocr' | 'vlm-only' | 'google-vision' = 'vlm';
   if (detectorCfg === 'ocr') detector = 'ocr';
   else if (detectorCfg === 'vlm-only') detector = 'vlm-only';
+  else if (detectorCfg === 'google-vision') detector = 'google-vision';
 
-  if (detector !== 'ocr') {
+  if (detector === 'google-vision') {
+    logger.info('Checking Google Vision detector availability...');
+    const gvCheck = await checkGoogleVisionAvailability();
+    if (!gvCheck.available) {
+      logger.error('Google Vision detector is NOT available:');
+      for (const line of (gvCheck.reason || '').split('\n')) {
+        logger.error('  ' + line);
+      }
+      logger.warn('Falling back to "vlm" mode (VLM + OCR fallback).');
+      detector = 'vlm';
+    } else {
+      logger.info('✓ Google Vision detector available and configured.');
+      logger.info('Pre-initializing Google Vision client...');
+      await preInitGoogleVision();
+    }
+  }
+
+  if (detector !== 'ocr' && detector !== 'google-vision') {
     logger.info('Checking VLM detector availability...');
     const vlmCheck = await checkVlmAvailability();
     if (!vlmCheck.available) {
@@ -306,9 +330,9 @@ export async function startLiveListener(
   }
 
   // Pre-initialize the Tesseract OCR worker regardless of detector mode.
-  // Even in VLM mode, OCR is used for symbol detection (whitespace analysis)
-  // and as a fallback when VLM fails. Pre-loading the English language data
-  // at startup saves ~2-5s on the first screenshot's OCR call.
+  // Even in google-vision mode, Tesseract is used for symbol detection
+  // (whitespace analysis of the header bar). Only the option-type (CE/PE)
+  // detection is delegated to Google Vision.
   logger.info('Pre-initializing Tesseract OCR worker...');
   await preInitOcr();
 
@@ -804,8 +828,117 @@ async function analyzeScreenshot(
   imageBuffer: Buffer,
   imagePath: string,
   writePromise: Promise<void>,
-  detector: 'vlm' | 'ocr' | 'vlm-only',
+  detector: 'vlm' | 'ocr' | 'vlm-only' | 'google-vision',
 ): Promise<AnalysisResult> {
+  // -----------------------------------------------------------------------
+  // GOOGLE-VISION MODE: Tesseract for symbol, Google Vision for CE/PE
+  // -----------------------------------------------------------------------
+  // Symbol detection uses the PROVEN Tesseract + whitespace analysis
+  // (measures the width of the colored header bar to distinguish
+  // NIFTY vs BANKNIFTY). This is more reliable than text-based detection
+  // because the symbol text is often in a colored bar that OCR struggles
+  // with, but the BAR WIDTH is a dead giveaway.
+  //
+  // Option-type (CE/PE) detection uses Google Vision for speed (~300ms
+  // vs 2-5s for Tesseract). Google Vision's superior OCR handles the
+  // small CE/PE text that Tesseract frequently misreads.
+  //
+  // Both run IN PARALLEL for minimum latency.
+  if (detector === 'google-vision') {
+    // --- Symbol detection: Tesseract + whitespace (same as other modes) ---
+    const ocrPromise = ocrHeaderOnce(imageBuffer).catch((err) => {
+      throw new Error(`Unified OCR failed: ${errToString(err)}`);
+    });
+
+    const symbolPromise: Promise<{
+      score: DetectionScore<string>;
+      ocrFailed: boolean;
+    }> = ocrPromise
+      .then(async (ocrResult) => {
+        let score = detectByWhitespaceFromOcr(ocrResult);
+        if (!score.value) {
+          logger.debug('Single-pass symbol detection failed, falling back to original method');
+          score = await detectByWhitespace(imageBuffer);
+        }
+        return { score, ocrFailed: false };
+      })
+      .catch((err) => {
+        logger.warn('Unified OCR failed for symbol detection, trying standalone method', {
+          error: errToString(err),
+        });
+        return detectByWhitespace(imageBuffer).then((score) => ({ score, ocrFailed: true }));
+      });
+
+    // --- Option-type detection: Google Vision (fast, accurate for CE/PE) ---
+    const optionPromise: Promise<DetectionScore<OptionType>> = (async () => {
+      try {
+        const gvOcr = await ocrHeaderWithGoogleVision(imageBuffer);
+        const score = detectOptionTypeByGoogleVisionFromText(gvOcr);
+        if (score.value) {
+          logger.info(`Google Vision detected: ${score.value} (${score.confidence}%)`);
+          return score;
+        }
+        // Google Vision didn't find CE/PE — fall back to Tesseract OCR
+        logger.warn('Google Vision CE/PE detection returned null, falling back to Tesseract OCR');
+        const ocrResult = await ocrPromise;
+        let fallback = detectOptionTypeFromHeaderOcr(ocrResult);
+        if (!fallback.value) {
+          await writePromise;
+          fallback = await detectOptionTypeByOcr(imagePath);
+        }
+        return fallback;
+      } catch (err) {
+        // Google Vision failed entirely — fall back to Tesseract OCR
+        logger.warn('Google Vision failed, falling back to Tesseract OCR', {
+          error: errToString(err),
+        });
+        try {
+          const ocrResult = await ocrPromise;
+          let fallback = detectOptionTypeFromHeaderOcr(ocrResult);
+          if (!fallback.value) {
+            await writePromise;
+            fallback = await detectOptionTypeByOcr(imagePath);
+          }
+          return fallback;
+        } catch {
+          await writePromise;
+          return detectOptionTypeByOcr(imagePath);
+        }
+      }
+    })();
+
+    // --- Await both in parallel ---
+    const [symbolResult, optionScore] = await Promise.all([symbolPromise, optionPromise]);
+    const symbolScore = symbolResult.score;
+
+    const symbol = symbolScore.value;
+    const optionType = optionScore.value;
+    const sConf = symbolScore.confidence;
+    const oConf = optionScore.confidence;
+
+    let confidence: number;
+    if (sConf === 0 && oConf === 0) {
+      confidence = 0;
+    } else if (sConf > 0 && oConf > 0) {
+      confidence = clampConfidence(sConf * 0.6 + oConf * 0.4);
+    } else {
+      confidence = clampConfidence(Math.max(sConf, oConf));
+    }
+
+    let method: string | null = null;
+    if (symbolScore.value && optionScore.value) {
+      method = optionScore.method ?? 'google-vision';
+    } else if (symbolScore.value) {
+      method = symbolScore.method;
+    } else if (optionScore.value) {
+      method = optionScore.method;
+    }
+
+    return { symbol, optionType, confidence, method };
+  }
+
+  // -----------------------------------------------------------------------
+  // STANDARD PATH: Tesseract OCR + VLM/OCR (original pipeline)
   // -----------------------------------------------------------------------
   // Phase 1: Run symbol detection and option-type detection IN PARALLEL.
   // -----------------------------------------------------------------------

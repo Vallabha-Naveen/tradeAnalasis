@@ -48,9 +48,11 @@ export type TradeMode = 'PROGRAM' | 'MANUAL';
  * - SL / TARGET / EOD — program-driven exits
  * - EXTERNAL — position was closed outside this program (manually by user,
  *   or auto-squared-off by Fyers during downtime). P&L may be unknown.
+ * - MANUAL — user tapped "Force Close" on the bot message to tell the
+ *   program to stop monitoring (no BUY order placed)
  * - ERROR — exit attempt failed (logged; position may still be open)
  */
-export type ExitReason = 'SL' | 'TARGET' | 'EOD' | 'EXTERNAL' | 'ERROR';
+export type ExitReason = 'SL' | 'TARGET' | 'EOD' | 'EXTERNAL' | 'MANUAL' | 'ERROR';
 
 /** Information about a placed trade, used to compose the bot notification. */
 export interface TradeNotification {
@@ -93,6 +95,13 @@ export interface ToggleResult {
  */
 export type ToggleCallback = (tradeId: number, newMode: TradeMode) => Promise<ToggleResult>;
 
+/**
+ * Callback signature for force-close events. The bot calls this when the
+ * user taps the "Force Close" button; the TradeManager implements it and
+ * marks the trade as EXITED without placing a BUY order.
+ */
+export type ForceCloseCallback = (tradeId: number) => Promise<{ success: boolean; reason?: string }>;
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -117,9 +126,16 @@ export class TradeBot {
   private readonly token: string;
   private readonly allowedUserId: number;
   private onToggleCb: ToggleCallback | null = null;
+  private onForceCloseCb: ForceCloseCallback | null = null;
 
   /** Set to true after start() succeeds. */
   private started = false;
+
+  /** Manual polling state. */
+  private pollingAbort = false;
+  private pollingTimer: NodeJS.Timeout | null = null;
+  private pollingOffset = 0;
+  private pollingInFlight = false;
 
   constructor(token: string, allowedUserId: number) {
     this.token = token;
@@ -132,6 +148,14 @@ export class TradeBot {
    */
   onToggle(cb: ToggleCallback): void {
     this.onToggleCb = cb;
+  }
+
+  /**
+   * Register the force-close callback. Must be called BEFORE start().
+   * Called when the user taps the "Force Close" button.
+   */
+  onForceClose(cb: ForceCloseCallback): void {
+    this.onForceCloseCb = cb;
   }
 
   /**
@@ -152,6 +176,17 @@ export class TradeBot {
 
     try {
       this.bot = new Telegraf(this.token);
+
+      // ----- Health check: verify the token is valid BEFORE launching -----
+      // This catches invalid/expired/mistyped tokens immediately. Without
+      // this check, bot.launch() succeeds (it just starts a polling loop)
+      // and the first failure happens silently inside telegraf's retry
+      // logic — the user would never see an error, just missing messages.
+      const me = await this.bot.telegram.getMe();
+      logger.info(
+        `TradeBot: token verified ✓ — connected as @${me.username} ` +
+          `(id: ${me.id}, name: "${me.first_name}")`,
+      );
 
       // ----- /start command (registers the chat) -----
       this.bot.start((ctx) => {
@@ -175,23 +210,138 @@ export class TradeBot {
         void ctx.reply('📊 Use the latest trade message to check status. Each trade has its own living message.');
       });
 
+      // ----- /close <tradeId> command — force-close a trade -----
+      // Usage: /close 32
+      // Marks the trade as EXITED without placing a BUY order.
+      // Use when you've already closed the position manually in Fyers.
+      this.bot.command('close', async (ctx) => {
+        if (ctx.from?.id !== this.allowedUserId) return;
+
+        const args = ctx.message.text.split(/\s+/).slice(1);
+        if (args.length === 0) {
+          void ctx.reply(
+            'Usage: /close <tradeId>\n\n' +
+              'Example: /close 32\n\n' +
+              'Force-closes a trade — stops monitoring WITHOUT placing a BUY order.\n' +
+              'Use when you\'ve already closed the position manually in Fyers.',
+          );
+          return;
+        }
+
+        const tradeId = parseInt(args[0]!);
+        if (isNaN(tradeId)) {
+          void ctx.reply(`⚠️ Invalid trade ID: "${args[0]}". Usage: /close <tradeId>`);
+          return;
+        }
+
+        if (!this.onForceCloseCb) {
+          void ctx.reply('⚠️ Force-close is not available (trade manager not connected).');
+          return;
+        }
+
+        try {
+          const result = await this.onForceCloseCb(tradeId);
+          if (result.success) {
+            void ctx.reply(`✋ Trade ${tradeId} force-closed — monitoring stopped.`);
+          } else {
+            void ctx.reply(`⚠️ Could not force-close trade ${tradeId}: ${result.reason ?? 'unknown error'}`);
+          }
+        } catch (err) {
+          void ctx.reply(`⚠️ Error force-closing trade ${tradeId}: ${errToString(err)}`);
+        }
+      });
+
       // ----- Inline button callback handler -----
       this.bot.on('callback_query', async (ctx) => {
         await this.handleCallback(ctx);
       });
 
-      // Launch long-polling. telegraf.handle∆ handles updates sequentially.
-      await this.bot.launch();
+      // ----- Error handler for middleware errors (command/callback handlers) -----
+      this.bot.catch((err, ctx) => {
+        logger.error('TradeBot: handler error (caught by bot.catch)', {
+          error: errToString(err),
+          updateType: ctx?.update ? Object.keys(ctx.update)[0] ?? 'unknown' : 'unknown',
+        });
+      });
+
+      // ----- Step 1: Delete any existing webhook (so we can poll) -----
+      logger.info('TradeBot: clearing any existing webhook...');
+      try {
+        await this.withTimeout(
+          this.bot.telegram.deleteWebhook({ drop_pending_updates: false }),
+          10_000,
+        );
+        logger.info('TradeBot: webhook cleared ✓');
+      } catch (err) {
+        const e = errToString(err);
+        if (e.includes('timed out')) {
+          logger.warn(
+            'TradeBot: deleteWebhook timed out (10s) — continuing anyway',
+          );
+        } else {
+          logger.debug('TradeBot: deleteWebhook returned error (usually harmless)', { error: e });
+        }
+      }
+
+      // ----- Step 2: Start MANUAL polling (bypass bot.launch entirely) -----
+      // WHY: bot.launch() can hang indefinitely with no error output. Telegraf
+      // swallows polling errors (409 Conflict, network failures) inside its
+      // internal retry loop, so you never see the actual error. By polling
+      // manually with getUpdates(), EVERY error is caught and logged with
+      // the actual Telegram API error message.
       this.started = true;
+      this.startManualPolling();
       logger.info(
-        `TradeBot: started — notifications will be sent to user ID ${this.allowedUserId}`,
+        `TradeBot: manual polling started — notifications will be sent to user ID ${this.allowedUserId}`,
       );
 
-      // Graceful shutdown on process signals (telegraf stops polling).
-      // The parent process also calls stop() during its own cleanup, but
-      // this catches the case where telegraf receives the signal directly.
+      // ----- Step 3: Send a startup confirmation message -----
+      // This is a direct API call (sendMessage) that does NOT require the
+      // polling loop to be running. If it succeeds, you KNOW notifications
+      // will work even if launch() timed out.
+      if (this.bot) {
+        try {
+          await this.withTimeout(
+            this.bot.telegram.sendMessage(
+              this.allowedUserId,
+              '🟢 *Trade bot online*\n\n' +
+                'You will receive a notification here every time a trade is placed, ' +
+                'with inline buttons to toggle who manages it.\n\n' +
+                'If you see this message, notifications are working correctly.',
+              { parse_mode: 'Markdown' },
+            ),
+            10_000,
+          );
+          logger.info('TradeBot: startup confirmation message sent ✓');
+        } catch (err) {
+          const e = errToString(err);
+          if (e.includes('timed out')) {
+            logger.error(
+              'TradeBot: sendMessage TIMED OUT (10s) — Telegram API is unreachable!\n' +
+                '  This confirms a network issue. Check:\n' +
+                '    curl -s https://api.telegram.org/bot<YOUR_TOKEN>/getMe\n' +
+                '  If that also hangs, fix your network/firewall/proxy and restart.',
+            );
+          } else {
+            logger.error(
+              'TradeBot: FAILED to send startup confirmation message!\n' +
+                '  → Most likely cause: you have NOT sent /start to your bot yet.\n' +
+                '    Bots can only send messages to users who have initiated a chat.\n' +
+                '    Open Telegram, find your bot, send /start, then restart this program.\n' +
+                '  → Other causes: TELEGRAM_USER_ID is wrong, or the bot was blocked.',
+              { error: e, userId: this.allowedUserId },
+            );
+          }
+          // Don't return false — trade management still works.
+        }
+      }
+
+      // ----- Step 4: Register graceful shutdown (parent also calls stop()) -----
+      // We use process.once so the parent's own SIGINT/SIGTERM handler
+      // also fires. The parent's cleanup calls tradeBot.stop() too —
+      // double-calls are safe (stopManualPolling is idempotent).
       const sigHandler = (sig: string) => {
-        logger.info(`TradeBot: received ${sig}, stopping...`);
+        logger.info(`TradeBot: received ${sig}, stopping polling...`);
         this.stop();
       };
       process.once('SIGINT', () => sigHandler('SIGINT'));
@@ -199,18 +349,184 @@ export class TradeBot {
 
       return true;
     } catch (err) {
-      logger.error('TradeBot: failed to start', { error: errToString(err) });
+      logger.error(
+        'TradeBot: unexpected error during start() — this is why you got no notification!',
+        { error: errToString(err) },
+      );
       this.bot = null;
       this.started = false;
       return false;
     }
   }
 
+  // -------------------------------------------------------------------------
+  // Manual polling implementation
+  // -------------------------------------------------------------------------
+  //
+  // We bypass bot.launch() entirely and implement our own polling loop
+  // using bot.telegram.getUpdates(). This gives us:
+  //   1. Full control over error handling — every error is caught and
+  //      logged with the ACTUAL Telegram API error message
+  //   2. No silent retries — if getUpdates fails, we see it immediately
+  //   3. No hang — each getUpdates call has a hard timeout
+  //   4. Clean shutdown — pollingAbort flag stops the loop cleanly
+  //
+  // Updates are fed to bot.handleUpdate() which runs the full telegraf
+  // middleware chain (command handlers, callback query handlers, etc.).
+
+  /**
+   * Long-poll timeout in seconds. Telegram will hold the connection open
+   * for this many seconds waiting for new updates before returning an
+   * empty array. 5s is a good balance — responsive but not too chatty.
+   */
+  private static readonly POLL_TIMEOUT_SECONDS = 5;
+
+  /**
+   * Overall HTTP timeout for getUpdates (ms). Must be greater than
+   * POLL_TIMEOUT_SECONDS * 1000 to allow for the long-poll + network RTT.
+   */
+  private static readonly POLL_HTTP_TIMEOUT_MS = 15_000;
+
+  /** Delay between poll cycles when there's an error (ms). */
+  private static readonly POLL_ERROR_DELAY_MS = 3_000;
+
+  /** Small delay between successful polls (ms) — prevents tight looping. */
+  private static readonly POLL_IDLE_DELAY_MS = 100;
+
+  /**
+   * Start the manual polling loop. Returns immediately — the loop runs
+   * in the background via a self-scheduling setTimeout chain.
+   */
+  private startManualPolling(): void {
+    this.pollingAbort = false;
+    this.pollingOffset = 0;
+    this.pollingInFlight = false;
+    // Kick off the first poll
+    void this.pollOnce();
+  }
+
+  /** Stop the manual polling loop. Safe to call multiple times. */
+  private stopManualPolling(): void {
+    this.pollingAbort = true;
+    if (this.pollingTimer) {
+      clearTimeout(this.pollingTimer);
+      this.pollingTimer = null;
+    }
+  }
+
+  /** One polling iteration. */
+  private async pollOnce(): Promise<void> {
+    if (this.pollingAbort || !this.bot || !this.started) return;
+    if (this.pollingInFlight) return; // prevent overlap
+    this.pollingInFlight = true;
+
+    try {
+      const updates = await this.withTimeout(
+        this.bot.telegram.getUpdates(
+          TradeBot.POLL_TIMEOUT_SECONDS,  // timeout (seconds, long-poll)
+          100,                             // limit (max updates per call)
+          this.pollingOffset,              // offset (only fetch updates after this id)
+          ['message', 'callback_query'],   // allowedUpdates
+        ),
+        TradeBot.POLL_HTTP_TIMEOUT_MS,
+      );
+
+      // Process each update through the telegraf middleware chain
+      for (const update of updates) {
+        this.pollingOffset = update.update_id + 1;
+        try {
+          await this.bot.handleUpdate(update);
+        } catch (err) {
+          logger.error('TradeBot: error processing update', {
+            error: errToString(err),
+            updateId: update.update_id,
+          });
+        }
+      }
+
+      // Schedule next poll
+      if (!this.pollingAbort) {
+        this.pollingTimer = setTimeout(
+          () => void this.pollOnce(),
+          TradeBot.POLL_IDLE_DELAY_MS,
+        );
+      }
+    } catch (err) {
+      const e = errToString(err);
+
+      if (e.includes('timed out')) {
+        // Normal — long-poll returned no updates within the timeout window.
+        // This is NOT an error; just schedule the next poll.
+        logger.debug('TradeBot: getUpdates long-poll timeout (no new updates)');
+      } else if (e.includes('409') || e.toLowerCase().includes('conflict')) {
+        // 409 Conflict — another process is polling with the same token.
+        // This is the actual error that was being swallowed by telegraf.
+        logger.error(
+          'TradeBot: 409 Conflict — another process is already polling with this bot token!\n' +
+            '  This means:\n' +
+            '    - Another instance of this program is running, OR\n' +
+            '    - A previous run did not shut down cleanly, OR\n' +
+            '    - You restarted within 60 seconds (Telegram keeps the old session alive)\n' +
+            '  FIX:\n' +
+            '    1. Kill all instances:   ps aux | grep liveTrade\n' +
+            '    2. Wait 60 seconds for Telegram to release the polling lock\n' +
+            '    3. Restart this program\n' +
+            '  Polling will retry in 3 seconds...',
+          { error: e },
+        );
+      } else if (e.includes('401') || e.toLowerCase().includes('unauthorized')) {
+        logger.error(
+          'TradeBot: 401 Unauthorized — bot token is invalid or has been revoked!\n' +
+            '  FIX: Get a new token from @BotFather, update BOT_TOKEN in .env, restart.',
+          { error: e },
+        );
+      } else {
+        logger.error('TradeBot: getUpdates error', { error: e });
+      }
+
+      // Schedule retry after delay
+      if (!this.pollingAbort) {
+        this.pollingTimer = setTimeout(
+          () => void this.pollOnce(),
+          TradeBot.POLL_ERROR_DELAY_MS,
+        );
+      }
+    } finally {
+      this.pollingInFlight = false;
+    }
+  }
+
+  /**
+   * Run a promise with a timeout. If the promise doesn't resolve within
+   * `ms` milliseconds, reject with a "timed out" error.
+   */
+  private withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error(`Operation timed out after ${ms}ms`));
+      }, ms);
+      promise.then(
+        (result) => {
+          clearTimeout(timer);
+          resolve(result);
+        },
+        (err) => {
+          clearTimeout(timer);
+          reject(err);
+        },
+      );
+    });
+  }
+
   /** Stop the bot. Safe to call multiple times. */
   stop(): void {
+    // Stop the manual polling loop first
+    this.stopManualPolling();
+
     if (this.bot) {
       try {
-        this.bot.stop('TradeBot shutdown');
+        // Don't call bot.stop() — it's designed for bot.launch() mode and
+        // can hang. Our manual polling is already stopped above.
       } catch (err) {
         logger.warn('TradeBot: error during stop', { error: errToString(err) });
       }
@@ -367,19 +683,53 @@ export class TradeBot {
       return;
     }
 
-    // Parse "tg:<tradeId>:<P|M>"
+    // Parse "tg:<tradeId>:<P|M|F>"
     const parts = data.slice(CB_PREFIX.length).split(':');
     if (parts.length !== 2) {
       logger.warn(`TradeBot: malformed callback data "${data}"`);
       return;
     }
     const tradeId = parseInt(parts[0]!);
-    const modeChar = parts[1];
-    if (isNaN(tradeId) || (modeChar !== 'P' && modeChar !== 'M')) {
+    const actionChar = parts[1];
+    if (isNaN(tradeId) || (actionChar !== 'P' && actionChar !== 'M' && actionChar !== 'F')) {
       logger.warn(`TradeBot: invalid callback data "${data}"`);
       return;
     }
-    const newMode: TradeMode = modeChar === 'P' ? 'PROGRAM' : 'MANUAL';
+
+    // ----- Force Close action -----
+    if (actionChar === 'F') {
+      logger.info(`TradeBot: force-close request for trade ${tradeId}`);
+
+      if (!this.onForceCloseCb) {
+        logger.error('TradeBot: no force-close callback registered — dropping request');
+        await ctx
+          .reply('⚠️ Force-close is not available (no callback registered).')
+          .catch(() => {});
+        return;
+      }
+
+      try {
+        const result = await this.onForceCloseCb(tradeId);
+        if (!result.success) {
+          await ctx
+            .reply(`⚠️ Could not force-close trade ${tradeId}: ${result.reason ?? 'unknown error'}`)
+            .catch(() => {});
+        } else {
+          await ctx
+            .reply(`✋ Trade ${tradeId} force-closed — monitoring stopped.`)
+            .catch(() => {});
+        }
+      } catch (err) {
+        logger.error('TradeBot: force-close callback threw', {
+          error: errToString(err),
+          tradeId,
+        });
+      }
+      return;
+    }
+
+    // ----- Toggle mode action (P or M) -----
+    const newMode: TradeMode = actionChar === 'P' ? 'PROGRAM' : 'MANUAL';
 
     logger.info(`TradeBot: toggle request trade ${tradeId} → ${newMode}`);
 
@@ -453,6 +803,7 @@ export class TradeBot {
       TARGET: '🎯',
       EOD: '🔚',
       EXTERNAL: '🔍',
+      MANUAL: '✋',
       ERROR: '⚠️',
     };
     const reasonLabel: Record<ExitReason, string> = {
@@ -460,6 +811,7 @@ export class TradeBot {
       TARGET: 'Target hit',
       EOD: 'EOD auto square-off',
       EXTERNAL: 'Closed externally during downtime',
+      MANUAL: 'Force-closed by user',
       ERROR: 'Error',
     };
 
@@ -487,7 +839,11 @@ export class TradeBot {
 
   /**
    * Build the inline keyboard. The CURRENTLY-ACTIVE mode's button is
-   * shown as a "✓" checkmark to make the state obvious at a glance.
+   * shown as "(active)" to make the state obvious at a glance.
+   *
+   * Three buttons:
+   *   Row 1: [✅ I'll manage]  [🤖 You manage]   — toggle who monitors
+   *   Row 2: [🔴 Force Close]                     — stop monitoring immediately
    */
   private buildKeyboard(tradeId: number, currentMode: TradeMode) {
     const manualLabel = currentMode === 'MANUAL' ? '✅ I\'ll manage (active)' : '✅ I\'ll manage';
@@ -496,6 +852,9 @@ export class TradeBot {
       [
         Markup.button.callback(manualLabel, `${CB_PREFIX}${tradeId}:M`),
         Markup.button.callback(programLabel, `${CB_PREFIX}${tradeId}:P`),
+      ],
+      [
+        Markup.button.callback('🔴 Force Close', `${CB_PREFIX}${tradeId}:F`),
       ],
     ]).reply_markup;
   }
